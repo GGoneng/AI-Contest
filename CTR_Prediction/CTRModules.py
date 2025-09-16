@@ -5,6 +5,10 @@ from torch.utils.data import Dataset
 
 import os
 
+import numpy as np
+
+MAX_SEQ_LEN = 4000
+
 class CrossLayer(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -48,14 +52,27 @@ class DeepNetwork(nn.Module):
         return self.mlp(x)
 
 class DCNv2(nn.Module):
-    def __init__(self, input_dim, num_layers, hidden_dim, dropout):
+    def __init__(self, input_dim, num_layers, hidden_dim, dropout, num_embeddings, transformer_dim, nhead, num_encoder_layers):
         super().__init__()
-        self.cross = CrossNetwork(input_dim, num_layers)
-        self.deep = DeepNetwork(input_dim, hidden_dim, dropout)
+        
+        self.embedding = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=transformer_dim)
 
-        self.output = nn.Linear(input_dim + hidden_dim[-1], 1)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=nhead, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        
+        total_input_dim = input_dim + transformer_dim
 
-    def forward(self, x):
+        self.cross = CrossNetwork(total_input_dim, num_layers)
+        self.deep = DeepNetwork(total_input_dim, hidden_dim, dropout)
+
+        self.output = nn.Linear(total_input_dim + hidden_dim[-1], 1)
+
+    def forward(self, x, seq):
+        seq_emb = self.embedding(seq)  # (batch, seq_len, transformer_dim)
+        seq_out = self.transformer(seq_emb)  # (batch, seq_len, transformer_dim)
+        seq_vec = seq_out.mean(dim=1)  # sequence pooling
+        x = torch.concat([x, seq_vec], dim=1)
+        
         cross_out = self.cross(x)
         deep_out = self.deep(x)
 
@@ -65,8 +82,9 @@ class DCNv2(nn.Module):
     
 
 class CTRDataset(Dataset):
-    def __init__(self, feature, target=None):
+    def __init__(self, feature, seq, target=None):
         self.feature = feature
+        self.seq = seq
         self.target = target
 
     def __len__(self):
@@ -75,12 +93,66 @@ class CTRDataset(Dataset):
     def __getitem__(self, index):
         featureTS = torch.tensor(self.feature.iloc[index].values, dtype=torch.float32)
         
+        s = str(self.seq[index])
+
+        if s:
+            arr = np.fromstring(s, sep=",", dtype=np.float32)
+        else:
+            arr = np.array([0.0], dtype=np.float32)  # fallback
+
+
+        seq = torch.from_numpy(arr)
+
         if self.target is not None:
             targetTS = torch.tensor(self.target.iloc[index].values, dtype=torch.float32)
-            return featureTS, targetTS
+            return featureTS, seq, targetTS
         
         else:
-            return featureTS
+            return featureTS, seq
+        
+
+def map_to_unk(seq, max_id=600, unk_id=600):
+    return [x if x <= max_id else unk_id for x in seq]
+
+
+def collate_fn_train(batch):
+    xs, seqs, ys = zip(*batch)
+    xs = torch.stack(xs)
+    ys = torch.stack(ys)
+
+    batch_seqs = []
+
+    for s in seqs:
+        seq_mapped = map_to_unk(s.tolist())
+        if len(seq_mapped) > MAX_SEQ_LEN:
+            seq_mapped = seq_mapped[-MAX_SEQ_LEN:]
+
+        batch_seqs.append(torch.tensor(seq_mapped, dtype=torch.long))
+
+    seqs_padded = nn.utils.rnn.pad_sequence(batch_seqs, batch_first=True, padding_value=0)
+    seq_lengths = torch.tensor([len(s) for s in seqs], dtype=torch.long)
+    seq_lengths = torch.clamp(seq_lengths, min=1)  # 빈 시퀀스 방지
+    
+    return xs, seqs_padded, seq_lengths, ys
+
+
+def collate_fn_test(batch):
+    xs, seqs = zip(*batch)
+    xs = torch.stack(xs)
+    batch_seqs = []
+
+    for s in seqs:
+        seq_mapped = map_to_unk(s.tolist())
+        if len(seq_mapped) > MAX_SEQ_LEN:
+            seq_mapped = seq_mapped[-MAX_SEQ_LEN:]
+
+        batch_seqs.append(torch.tensor(seq_mapped, dtype=torch.long))
+
+    seqs_padded = nn.utils.rnn.pad_sequence(batch_seqs, batch_first=True, padding_value=0.0)
+    seq_lengths = torch.tensor([len(s) for s in seqs], dtype=torch.long)
+    seq_lengths = torch.clamp(seq_lengths, min=1)
+    
+    return xs, seqs_padded, seq_lengths
 
 
     
@@ -93,12 +165,12 @@ def testing(model, valDL, data_size, loss_fn, score_fn, device):
 
     with torch.no_grad():
         # Val DataLoader에 저장된 Feature, Target 텐서로 학습 진행
-        for featureTS, targetTS in valDL:
-            featureTS, targetTS = featureTS.to(device), targetTS.to(device)
+        for featureTS, seq, _, targetTS in valDL:
+            featureTS, seq, targetTS = featureTS.to(device), seq.to(device), targetTS.to(device)
 
             batch_size = len(targetTS)
     
-            pre_val = model(featureTS)
+            pre_val = model(featureTS, seq)
             
             loss = loss_fn(pre_val, targetTS).to(device)
 
@@ -138,13 +210,13 @@ def training(model, trainDL, valDL, optimizer, epoch,
         loss_total, score_total = 0, 0
 
         # Train DataLoader에 저장된 Feature, Target 텐서로 학습 진행
-        for featureTS, targetTS in trainDL:
-            featureTS, targetTS = featureTS.to(device), targetTS.to(device)
+        for featureTS, seq, _, targetTS in trainDL:
+            featureTS, seq, targetTS = featureTS.to(device), seq.to(device), targetTS.to(device)
 
             batch_size = len(targetTS)
 
             # 결과 추론
-            pre_val = model(featureTS)
+            pre_val = model(featureTS, seq)
 
             # 추론값으로 Loss값 계산
             loss = loss_fn(pre_val, targetTS)
