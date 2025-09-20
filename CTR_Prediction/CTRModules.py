@@ -7,7 +7,7 @@ import os
 
 import numpy as np
 
-MAX_SEQ_LEN = 4000
+MAX_SEQ_LEN = 2000
 
 class CrossLayer(nn.Module):
     def __init__(self, input_dim):

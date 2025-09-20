@@ -13,7 +13,7 @@ from sklearn.model_selection import train_test_split
 
 import gc
 
-DATA_PATH = "F:/CTR_Prediction/data/"
+DATA_PATH = "F:/CTR_Prediction/"
 
 X_train = pd.read_csv(DATA_PATH + "X_train.csv")
 X_val = pd.read_csv(DATA_PATH + "X_val.csv")
@@ -26,7 +26,7 @@ X_val_seq = X_val.pop("seq")
 
 
 
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 
 trainDS = CTRDataset(X_train, X_train_seq, y_train)
 valDS = CTRDataset(X_val, X_val_seq, y_val)
@@ -41,12 +41,12 @@ EPOCH = 300
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 LR = 1e-3
 
-hidden_dim = [1024, 512, 256, 128]
+hidden_dim = [512, 256, 128]
 
 num_embeddings = 600 + 1
-transformer_dim = 64
+transformer_dim = 32
 nhead = 4
-num_encoder_layers = 2
+num_encoder_layers = 1
 
 model = DCNv2(input_dim=X_train.shape[1],
               num_layers=2,
@@ -60,7 +60,7 @@ model = DCNv2(input_dim=X_train.shape[1],
 
 optimizer = optim.AdamW(model.parameters(), lr=LR)
 
-weight = torch.tensor([98 / 2])
+weight = torch.tensor([2])
 
 loss_fn = nn.BCELoss(weight=weight).to(DEVICE)
 score_fn = AUROC(task="binary")
