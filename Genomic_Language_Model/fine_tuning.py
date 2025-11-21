@@ -14,7 +14,7 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM
 from tqdm import tqdm
 
 SEED = 42
-MODEL_ID = "InstaDeepAI/nucleotide-transformer-v2-500m-multi-species"
+MODEL_ID = "InstaDeepAI/nucleotide-transformer-2.5b-multi-species"
 
 DATA_DIR = "./data"
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
