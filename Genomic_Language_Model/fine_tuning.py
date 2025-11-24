@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os, random
 import numpy as np
 import pandas as pd
@@ -13,13 +10,14 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from tqdm import tqdm
 
-SEED = 42
+SEED = 7
 MODEL_ID = "InstaDeepAI/nucleotide-transformer-2.5b-multi-species"
 
-DATA_DIR = "./data"
+DATA_DIR = "./genomic_language_model/"
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
+TRIPLET_PATH = os.path.join(DATA_DIR, "fine_tuning_triplet.csv")
 SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
-OUT_PATH = "submission_v1.csv"
+OUT_PATH = "submission_v2.csv"
 
 OUTPUT_DIM = 2048
 LAST_N_LAYERS = 24
@@ -30,7 +28,7 @@ BATCH_SIZE_INFER = 32
 NUM_WORKERS = 2
 
 TRAIN_EPOCHS = 3
-LR_HEAD = 5e-4
+LR = 5e-4
 WEIGHT_DECAY = 1e-4
 TRIPLET_MARGIN = 1.0
 
@@ -43,41 +41,6 @@ def set_seed(seed: int = 42):
 
 def l2_normalize(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return x / x.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
-
-_rc_map = str.maketrans("ACGT", "TGCA")
-def reverse_complement(seq: str) -> str:
-    return seq.translate(_rc_map)[::-1]
-
-def apply_biological_snv(seq: str, num_mutations: int) -> str:
-    bases = ['A', 'C', 'G', 'T']
-    s = list(seq)
-    idx_list = random.sample(range(len(s)), min(num_mutations, len(s)))
-    for idx in idx_list:
-        orig = s[idx]
-        candidates = [b for b in bases if b != orig]
-        s[idx] = random.choice(candidates)
-    return "".join(s)
-
-def generate_triplets(sequences: List[str], num_pairs: int):
-    rows = []
-    print(f"Generating {num_pairs} triplets")
-    for _ in range(num_pairs):
-        anchor = random.choice(sequences)
-        if len(anchor) > MAX_LENGTH:
-            start = random.randint(0, len(anchor) - MAX_LENGTH)
-            anchor = anchor[start:start+MAX_LENGTH]
-        
-        if random.random() < 0.5:
-            pos = anchor
-        else:
-            pos = reverse_complement(anchor)
-            
-        n_mut = random.randint(3, 15)
-        neg = apply_biological_snv(anchor, n_mut)
-        
-        rows.append([anchor, pos, neg])
-    return rows
-
 
 class RobustModel(nn.Module):
     def __init__(self, hidden_size: int, last_n: int, out_dim: int):
@@ -107,16 +70,18 @@ class RobustModel(nn.Module):
 
 def main():
     set_seed(SEED)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
     
     test_df = pd.read_csv(TEST_PATH)
     sequences = test_df['seq'].tolist()
-    
-    triplet_data = generate_triplets(sequences, 30000)
+
+    triplet_df = pd.read_csv(TRIPLET_PATH)
+    triplet_data = triplet_df.values.tolist()
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True)
+
     backbone.to(device)
     backbone.eval()
     
@@ -124,10 +89,10 @@ def main():
         p.requires_grad = False
         
     model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR_HEAD, weight_decay=WEIGHT_DECAY)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
     
-    print("학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용학습시작해용")
+    print("학습 시작")
     model.train()
     
     bs = BATCH_SIZE_TR
@@ -164,7 +129,7 @@ def main():
             
         print(f"Epoch {epoch+1} Loss: {np.mean(epoch_loss):.4f}")
         
-    print("추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용추론시작해용")
+    print("추론 시작")
     model.eval()
     sub_df = pd.read_csv(SAMPLE_SUB_PATH)
     embeddings = []
@@ -182,7 +147,7 @@ def main():
     emb_df = pd.DataFrame(embeddings, columns=col_names)
     final_df = pd.concat([sub_df[['ID']], emb_df], axis=1)
     final_df.to_csv(OUT_PATH, index=False)
-    print(f"저장해용: {OUT_PATH}")
+    print(f"저장: {OUT_PATH}")
 
 if __name__ == "__main__":
     main()
