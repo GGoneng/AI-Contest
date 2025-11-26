@@ -6,8 +6,10 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+
 from transformers import AutoTokenizer, AutoModelForMaskedLM
+from peft import PeftModel
+
 from tqdm import tqdm
 
 SEED = 7
@@ -17,7 +19,8 @@ DATA_DIR = "./genomic_language_model/"
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
 TRIPLET_PATH = os.path.join(DATA_DIR, "fine_tuning_triplet.csv")
 SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
-OUT_PATH = "submission_v2.csv"
+SAVE_LORA_WEIGHT = os.path.join(DATA_DIR, "lora_weights")
+OUT_PATH = "submission_v3.csv"
 
 OUTPUT_DIM = 2048
 LAST_N_LAYERS = 24
@@ -32,7 +35,7 @@ LR = 5e-4
 WEIGHT_DECAY = 1e-4
 TRIPLET_MARGIN = 1.0
 
-def set_seed(seed: int = 42):
+def set_seed(seed: int=7):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -81,14 +84,15 @@ def main():
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True)
+    lora_model = PeftModel.from_pretrained(backbone, SAVE_LORA_WEIGHT)
 
-    backbone.to(device)
-    backbone.eval()
+    lora_model.to(device)
+    lora_model.eval()
     
-    for p in backbone.parameters():
+    for p in lora_model.parameters():
         p.requires_grad = False
         
-    model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
+    model = RobustModel(lora_model.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
     
