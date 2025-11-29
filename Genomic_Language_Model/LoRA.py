@@ -25,8 +25,8 @@ MODEL_ID = "InstaDeepAI/nucleotide-transformer-2.5b-multi-species"
 BASE_DIR = "./genomic_language_model"
 
 TEST_PATH = os.path.join(BASE_DIR, "test.csv")
-LORA_PATH = os.path.join(BASE_DIR, "plant_nucleotide.csv")
-TRIPLET_PATH = os.path.join(BASE_DIR, "fine_tuning_triplet.csv")
+# LORA_PATH = os.path.join(BASE_DIR, "plant_nucleotide.csv")
+TRIPLET_PATH = os.path.join(BASE_DIR, "triplet_data.csv")
 SUBMISSION_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
 
 OUTPUT_PATH = "submission.csv"
@@ -36,28 +36,18 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 EPOCH = 5
 LR = 5e-5
 
+target_layers = ["encoder.layer.{}.attention.self.query".format(i) for i in range(28, 32)]
+target_layers += ["encoder.layer.{}.attention.self.key".format(i) for i in range(28, 32)]
+target_layers += ["encoder.layer.{}.attention.self.value".format(i) for i in range(28, 32)]
+target_layers += ["encoder.layer.{}.attention.self.output".format(i) for i in range(28, 32)]
 
 lora_config = LoraConfig(
-    r=8,
+    r=4,
     lora_alpha=16,
     lora_dropout=0.05,
-    target_modules=["query", "key", "value"],
+    target_modules=target_layers,
     bias="none",
-    task_type="CAUSAL_LM"
-)
-
-lora_args = TrainingArguments(
-    output_dir="./lora_mlm_out",
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=4,
-    learning_rate=5e-4,
-    num_train_epochs=3,
-    warmup_ratio=0.05,
-    weight_decay=0.01,
-    fp16=False,
-    logging_steps=100,
-    save_steps=2000,
-    save_total_limit=2
+    task_type="FEATURE_EXTRACTION"
 )
 
 def set_seed(seed: int=7) -> None:
@@ -70,91 +60,81 @@ def set_seed(seed: int=7) -> None:
 def l2_normalize(x: torch.Tensor, eps: float=1e-12) -> torch.Tensor:
     return x / x.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
 
-# class LoraDataset(Dataset):
-#     def __init__(self, seqs, tokenizer, max_len: int=512):
-#         self.seqs = seqs
-#         self.tokenizer = tokenizer
-#         self.max_len = max_len
+class TripletLoss(nn.Module):
+    def __init__(self, margin: float = 0.5):
+        super().__init__()
+        self.margin = margin
 
-#     def __len__(self):
-#         return len(self.seqs)
+    def forward(self, anchor, positive, negative):
+        # L2 normalize embeddings
+        anchor = F.normalize(anchor, dim=-1)
+        positive = F.normalize(positive, dim=-1)
+        negative = F.normalize(negative, dim=-1)
 
-#     def __getitem__(self, idx):
-#         seq = self.seqs[idx]
+        # Cosine distance: 1 - cos_sim
+        pos_dist = 1 - F.cosine_similarity(anchor, positive, dim=-1)
+        neg_dist = 1 - F.cosine_similarity(anchor, negative, dim=-1)
 
-#         enc = self.tokenizer(
-#             seq,
-#             truncation=True,
-#             max_length=self.max_len,
-#             padding="longest",      # 절대 padding 하지마세요
-#             return_tensors="pt" # 리스트 그대로
-#         )
-#         return {
-#             "input_ids": enc["input_ids"],
-#             "attention_mask": enc["attention_mask"]
-#         }
+        # Triplet loss = max(0, pos_dist - neg_dist + margin)
+        loss = F.relu(pos_dist - neg_dist + self.margin)
 
-class LoraDataset(Dataset):
-    def __init__(self, seqs: List, tokenizer: AutoTokenizer, max_len: int=512, mask_prob: float=0.15):
-        self.seqs = seqs
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.mask_prob = mask_prob
+        return loss.mean()
+
+class LoRADataset(Dataset):
+    def __init__(self, df, tokenizer):
+        self.df = df
+        self.tok = tokenizer
 
     def __len__(self):
-        return len(self.seqs)
-    
+        return len(self.df)
+
     def __getitem__(self, idx):
-        seq = self.seqs[idx]
-
-        enc = self.tokenizer(
-            seq,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_len
-        )
-
-        input_ids = enc["input_ids"][0]
-        labels = input_ids.clone()
-
-        rand = torch.rand(input_ids.shape)
-        mask_arr = (rand < self.mask_prob) & (input_ids != self.tokenizer.pad_token_id)
-
-        input_ids[mask_arr] = self.tokenizer.mask_token_id
-        labels[~mask_arr] = -100
+        row = self.df.iloc[idx]
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": enc["attention_mask"][0],
-            "labels": labels
+            "anchor": row["seq"],
+            "pos": row["positive"],
+            "neg": row["negative"]
         }
-    
-    
-def validating(model, valDL, data_size, device):
+
+def get_embedding(backbone, seq_list, tokenizer, max_len, device):
+    tokens = tokenizer(
+        seq_list, 
+        return_tensors="pt", 
+        padding=True, 
+        truncation=True,
+        max_length=max_len
+    ).to(device)
+
+    out = backbone(**tokens, output_hidden_states=True)
+    h = out.hidden_states[-1]           # 마지막 layer hidden state (B,L,D)
+    pooled = h.mean(dim=1)              # mean pooling
+    emb = F.normalize(pooled, dim=-1)   # projection head 없이 방향만 정규화
+
+    return emb
+
+
+def validating(model, valDL, data_size, tokenizer, max_len, loss_fn, device):
     model.eval()
 
     loss_total = 0
 
     use_amp = (DEVICE == "cuda")
-
+    
     with torch.no_grad():
         for batch in tqdm(valDL):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            anchor = batch["anchor"]
+            pos = batch["pos"]
+            neg = batch["neg"]
 
-
-            batch_size = len(input_ids)
+            batch_size = len(batch)
             
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                anchor = get_embedding(model, anchor, tokenizer, max_len, device)
+                pos = get_embedding(model, pos, tokenizer, max_len, device)
+                neg = get_embedding(model, neg, tokenizer, max_len, device)
 
-                loss = outputs.loss
+                loss = loss_fn(anchor, pos, neg)
 
             loss_total += loss.item() * batch_size
     
@@ -164,7 +144,8 @@ def validating(model, valDL, data_size, device):
 
     
 def training(model, trainDL, valDL, optimizer, epoch,
-            data_size, val_data_size, scheduler, device):
+            data_size, val_data_size, tokenizer, max_len,
+            loss_fn, scheduler, device):
     SAVE_PATH = "./saved_models"
     os.makedirs(SAVE_PATH, exist_ok=True)
 
@@ -183,21 +164,18 @@ def training(model, trainDL, valDL, optimizer, epoch,
         loss_total = 0
 
         for batch in tqdm(trainDL):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+            anchor = batch["anchor"].to(device)
+            pos = batch["pos"].to(device)
+            neg = batch["neg"].to(device)
 
-
-            batch_size = len(input_ids)
+            batch_size = len(batch)
 
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                anchor = get_embedding(model, anchor, tokenizer, max_len, device)
+                pos = get_embedding(model, pos, tokenizer, max_len, device)
+                neg = get_embedding(model, neg, tokenizer, max_len, device)
 
-                loss = outputs.loss
+                loss = loss_fn(anchor, pos, neg)
 
             loss_total += loss.item() * batch_size
 
@@ -205,7 +183,7 @@ def training(model, trainDL, valDL, optimizer, epoch,
             loss.backward()
             optimizer.step()
         
-        val_loss = validating(model, valDL, val_data_size, device)
+        val_loss = validating(model, valDL, val_data_size, tokenizer, max_len, loss_fn, device)
 
         LOSS_HISTORY[0].append(loss_total / data_size)
         LOSS_HISTORY[1].append(val_loss)
@@ -234,7 +212,7 @@ def training(model, trainDL, valDL, optimizer, epoch,
 
 
 def main():
-    lora_df = pd.read_csv(LORA_PATH)
+    lora_df = pd.read_csv(TRIPLET_PATH)[:100000]
 
     train_df, val_df = train_test_split(lora_df, test_size=0.1, shuffle=True)
 
@@ -245,15 +223,17 @@ def main():
 
     print(f"학습 파라미터 수 : {model.print_trainable_parameters()}")
 
+    loss_fn = TripletLoss()
+
     max_seq_len = lora_df["seq"].str.len().max()
     MODEL_CAP = tokenizer.model_max_length
 
     MAX_LEN = min(MODEL_CAP, max_seq_len)
 
-    train_dataset = LoraDataset(train_df["seq"].tolist(), tokenizer, MAX_LEN)
+    train_dataset = LoRADataset(train_df, tokenizer)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    val_dataset = LoraDataset(val_df["seq"].tolist(), tokenizer, MAX_LEN)
+    val_dataset = LoRADataset(val_df, tokenizer)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     optimizer = optim.AdamW(model.parameters(), lr=LR)
@@ -264,7 +244,9 @@ def main():
 
     loss = training(model=model, trainDL=train_loader, valDL=val_loader,
                     optimizer=optimizer, epoch=EPOCH, data_size=data_size,
-                    val_data_size=val_data_size, scheduler=scheduler, device=DEVICE)
+                    val_data_size=val_data_size, tokenizer=tokenizer,
+                    max_len=MAX_LEN, loss_fn=loss_fn, scheduler=scheduler,
+                    device=DEVICE)
     
     print("LoRA 파인튜닝 완료")
 
