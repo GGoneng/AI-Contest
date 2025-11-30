@@ -19,11 +19,11 @@ DATA_DIR = "./genomic_language_model/"
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
 TRIPLET_PATH = os.path.join(DATA_DIR, "triplet_data.csv")
 SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
-# SAVE_LORA_WEIGHT = "F:\AI-Contest\Genomic_Language_Model\lora_weights"
-OUT_PATH = "submission_v10.csv"
+SAVE_LORA_WEIGHT = os.path.join(DATA_DIR, "lora_weights")
+OUT_PATH = "submission_v12.csv"
 
 OUTPUT_DIM = 2048
-LAST_N_LAYERS = 33
+LAST_N_LAYERS = 12
 MAX_LENGTH = 512
 USE_FP16 = True
 BATCH_SIZE_TR = 32
@@ -55,8 +55,12 @@ class AttentionPooling(nn.Module):
 
         scores = self.att(feats).squeeze(-1)  # (B, L)
 
-        # pad mask 처리
-        scores = scores.masked_fill(mask == 0, -1e9)
+        mask_bool = mask.to(torch.bool)
+
+        # 동일 dtype/device에서 표현 가능한 최솟값 사용
+        fill = torch.finfo(scores.dtype).min
+        scores = scores.masked_fill(~mask_bool, fill)
+
 
         weights = F.softmax(scores, dim=-1)   # (B, L)
 
@@ -76,12 +80,12 @@ class RobustModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.2)
         )
-        self.linear2 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.GELU(),
-            nn.Dropout(0.2)
-        )
+        # self.linear2 = nn.Sequential(
+        #     nn.Linear(hidden_size, hidden_size),
+        #     nn.LayerNorm(hidden_size),
+        #     nn.GELU(),
+        #     nn.Dropout(0.2)
+        # )
         self.final = nn.Linear(hidden_size, out_dim)
 
 
@@ -93,7 +97,7 @@ class RobustModel(nn.Module):
         mean_emb = self.pool(feat, mask)
         
         x = self.linear1(mean_emb) + mean_emb
-        x = self.linear2(x) + x
+        # x = self.linear2(x) + x
         x = self.final(x)
 
         return l2_normalize(x)
@@ -153,18 +157,23 @@ def main():
     sequences = test_df['seq'].tolist()
 
     triplet_df = pd.read_csv(TRIPLET_PATH)
-    triplet_data = triplet_df.values.tolist()[:100000]
+    triplet_data = triplet_df.values.tolist()[100000:200000]
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = backbone.to(device)
     
     backbone.eval()
+
+    lora = PeftModel.from_pretrained(
+        backbone,
+        SAVE_LORA_WEIGHT
+    )
     
-    for p in backbone.parameters():
+    for p in lora.parameters():
         p.requires_grad = False
         
-    model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
+    model = RobustModel(lora.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
     loss_fn = InfoNCELoss()
