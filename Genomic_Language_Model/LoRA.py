@@ -15,10 +15,10 @@ from tqdm import tqdm
 MODEL_ID = "InstaDeepAI/nucleotide-transformer-2.5b-multi-species"
 BASE_DIR = "./genomic_language_model"
 TRIPLET_PATH = os.path.join(BASE_DIR, "triplet_data.csv")
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCH = 5
-LR = 5e-5
+EPOCH = 10
+LR = 1e-4
 
 
 def set_seed(seed: int = 7) -> None:
@@ -41,10 +41,17 @@ class TripletLoss(nn.Module):
         positive = F.normalize(positive, dim=-1)
         negative = F.normalize(negative, dim=-1)
 
-        pos_dist = ((1 - F.cosine_similarity(anchor, positive, dim=-1)) ** 2) * 100
-        neg_dist = ((1 - F.cosine_similarity(anchor, negative, dim=-1)) ** 2) * 100
+        pos_cos = 1 - F.cosine_similarity(anchor, positive, dim=-1)
+        neg_cos = 1 - F.cosine_similarity(anchor, negative, dim=-1)
+
+        pos_dist = pos_cos * 100
+        neg_dist = neg_cos * 100
 
         loss = F.relu(pos_dist - neg_dist + self.margin) * 3
+        
+        print("Anchor-Positive Cosine Dist:", pos_cos.mean().item())
+        print("Anchor-Negative Cosine Dist:", neg_cos.mean().item())
+        print("Loss:", loss.mean().item())
 
         return loss.mean()
 
@@ -181,8 +188,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    model = EmbeddingModel(backbone)
-
     target_layers = []
     for i in range(20, 32):
         target_layers += [
@@ -195,8 +200,10 @@ def main():
             f"esm.encoder.layer.{i}.LayerNorm"
         ]
 
-    freeze_all(model)
-    unfreeze_layers(model, target_layers)
+    freeze_all(backbone)
+    unfreeze_layers(backbone, target_layers)
+
+    model = EmbeddingModel(backbone).to(DEVICE)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
