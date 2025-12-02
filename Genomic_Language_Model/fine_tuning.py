@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from peft import PeftModel
 
+from scipy.stats import pearsonr
+
 from tqdm import tqdm
 
 SEED = 7
@@ -50,19 +52,13 @@ class AttentionPooling(nn.Module):
         self.att = nn.Linear(hidden_size, 1)
 
     def forward(self, feats, mask):
-        # feats: (B, L, H)
-        # mask:  (B, L)
-
-        scores = self.att(feats).squeeze(-1)  # (B, L)
-
+        scores = self.att(feats).squeeze(-1)
         mask_bool = mask.to(torch.bool)
 
-        # 동일 dtype/device에서 표현 가능한 최솟값 사용
         fill = torch.finfo(scores.dtype).min
         scores = scores.masked_fill(~mask_bool, fill)
 
-
-        weights = F.softmax(scores, dim=-1)   # (B, L)
+        weights = F.softmax(scores, dim=-1)
 
         pooled = torch.sum(feats * weights.unsqueeze(-1), dim=1)
         return pooled
@@ -80,12 +76,12 @@ class RobustModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.2)
         )
-        # self.linear2 = nn.Sequential(
-        #     nn.Linear(hidden_size, hidden_size),
-        #     nn.LayerNorm(hidden_size),
-        #     nn.GELU(),
-        #     nn.Dropout(0.2)
-        # )
+        self.linear2 = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
         self.final = nn.Linear(hidden_size, out_dim)
 
 
@@ -97,7 +93,7 @@ class RobustModel(nn.Module):
         mean_emb = self.pool(feat, mask)
         
         x = self.linear1(mean_emb) + mean_emb
-        # x = self.linear2(x) + x
+        x = self.linear2(x) + x
         x = self.final(x)
 
         return l2_normalize(x)
@@ -150,55 +146,43 @@ class InfoNCELoss(nn.Module):
 
 def main():
     set_seed(SEED)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     test_df = pd.read_csv(TEST_PATH)
     sequences = test_df['seq'].tolist()
 
     triplet_df = pd.read_csv(TRIPLET_PATH)
-    triplet_data = triplet_df.values.tolist()[100000:200000]
-    
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True)
-    backbone = backbone.to(device)
-    
-    backbone.eval()
+    # anchor, positive, negative, pos_mutations, neg_mutations 컬럼이 있다고 가정
+    triplet_data = triplet_df.values.tolist()[:50000]
 
-    lora = PeftModel.from_pretrained(
-        backbone,
-        SAVE_LORA_WEIGHT
-    )
-    
-    for p in lora.parameters():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
+    backbone.eval()
+    for p in backbone.parameters():
         p.requires_grad = False
-        
-    model = RobustModel(lora.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
+
+    model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
     loss_fn = InfoNCELoss()
-    
+
     print("학습 시작")
     model.train()
-    
+
     bs = BATCH_SIZE_TR
     for epoch in range(TRAIN_EPOCHS):
         random.shuffle(triplet_data)
         epoch_loss = []
 
-        epoch_pos_means = []
-        epoch_pos_mins  = []
-        epoch_pos_maxs  = []
-
-        epoch_neg_means = []
-        epoch_neg_mins  = []
-        epoch_neg_maxs  = []
+        # 평가용 기록
+        all_pos_dists, all_neg_dists = [], []
+        all_pos_mut, all_neg_mut = [], []
 
         for i in tqdm(range(0, len(triplet_data), bs)):
             batch = triplet_data[i:i+bs]
             if len(batch) < 2: continue
 
-            anchors, poss, negs = zip(*batch)
+            anchors, poss, negs, pos_muts, neg_muts = zip(*batch)
             all_seqs = list(anchors) + list(poss) + list(negs)
 
             enc = tokenizer(all_seqs, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt").to(device)
@@ -211,28 +195,22 @@ def main():
                 B = len(batch)
                 ea, ep, en = embs[:B], embs[B:2*B], embs[2*B:]
 
-                # POS similarity
-                pos_sim = (ea * ep).sum(dim=-1).detach().cpu()
-                epoch_pos_means.append(pos_sim.mean())
-                epoch_pos_mins.append(pos_sim.min())
-                epoch_pos_maxs.append(pos_sim.max())
+                # POS/NEG similarity 기록
+                pos_sim = (ea * ep).sum(dim=-1).detach().cpu().numpy()
+                neg_sim = (ea * en).sum(dim=-1).detach().cpu().numpy()
 
-                # NEG similarity
+                all_pos_dists.extend(pos_sim.tolist())
+                all_neg_dists.extend(neg_sim.tolist())
+                all_pos_mut.extend(pos_muts)
+                all_neg_mut.extend(neg_muts)
+
+                # Hard negative mining
                 K = 5
-
                 neg_sim_matrix = ea @ en.T
                 diag_mask = torch.eye(B, device=ea.device).bool()
                 neg_sim_matrix = neg_sim_matrix.masked_fill(diag_mask, float("-inf"))
-
                 _, topk_idx = torch.topk(neg_sim_matrix, K, dim=1)
-
                 en_topk = en[topk_idx]  # (B, K, dim)
-
-                topk_sims = torch.gather(neg_sim_matrix, 1, topk_idx)
-
-                epoch_neg_means.append(topk_sims.mean())
-                epoch_neg_mins.append(topk_sims.min())
-                epoch_neg_maxs.append(topk_sims.max())
 
                 loss = loss_fn(ea, ep, en_topk)
 
@@ -242,10 +220,20 @@ def main():
             opt.zero_grad()
             epoch_loss.append(loss.item())
 
-        # 에포크 끝나고 배치별 평균으로 통계 출력
-        print(f"Epoch {epoch+1} POS: mean={torch.tensor(epoch_pos_means).mean():.4f}, min={torch.tensor(epoch_pos_mins).mean():.4f}, max={torch.tensor(epoch_pos_maxs).mean():.4f}")
-        print(f"Epoch {epoch+1} NEG: mean={torch.tensor(epoch_neg_means).mean():.4f}, min={torch.tensor(epoch_neg_mins).mean():.4f}, max={torch.tensor(epoch_neg_maxs).mean():.4f}")
-        
+        # ====== 에포크 끝난 후 평가 지표 계산 ======
+        cd = (np.mean(all_pos_dists) + np.mean(all_neg_dists)) / 2
+        cdd = np.mean(all_neg_dists) - np.mean(all_pos_dists)
+
+        # PCC: 변이 개수 vs 거리
+        mut_counts = np.array(all_pos_mut + all_neg_mut)
+        dists = np.array(all_pos_dists + all_neg_dists)
+        if len(set(mut_counts)) > 1:
+            pcc, _ = pearsonr(mut_counts, dists)
+        else:
+            pcc = 0.0
+
+        print(f"[Epoch {epoch+1}] Loss={np.mean(epoch_loss):.4f} | CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f}")
+
     print("추론 시작")
     model.eval()
     sub_df = pd.read_csv(SAMPLE_SUB_PATH)
