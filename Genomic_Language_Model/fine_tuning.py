@@ -21,8 +21,8 @@ DATA_DIR = "./genomic_language_model/"
 TEST_PATH = os.path.join(DATA_DIR, "test.csv")
 TRIPLET_PATH = os.path.join(DATA_DIR, "triplet_data.csv")
 SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
-SAVE_LORA_WEIGHT = os.path.join(DATA_DIR, "lora_weights")
-OUT_PATH = "submission_v12.csv"
+
+OUT_PATH = "submission_v16.csv"
 
 OUTPUT_DIM = 2048
 LAST_N_LAYERS = 12
@@ -32,7 +32,7 @@ BATCH_SIZE_TR = 32
 BATCH_SIZE_INFER = 32
 NUM_WORKERS = 2
 
-TRAIN_EPOCHS = 5
+TRAIN_EPOCHS = 3
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
 
@@ -71,13 +71,19 @@ class RobustModel(nn.Module):
         self.pool = AttentionPooling(hidden_size)
 
         self.linear1 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LayerNorm(hidden_size * 2),
             nn.GELU(),
             nn.Dropout(0.2)
         )
         self.linear2 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+            nn.LayerNorm(hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(0.2)
+        )
+        self.linear3 = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.GELU(),
             nn.Dropout(0.2)
@@ -92,56 +98,69 @@ class RobustModel(nn.Module):
         
         mean_emb = self.pool(feat, mask)
         
-        x = self.linear1(mean_emb) + mean_emb
+        x = self.linear1(mean_emb)
         x = self.linear2(x) + x
+        x = self.linear2(x) + x
+        x = self.linear3(x)
         x = self.final(x)
 
         return l2_normalize(x)
 
-
-# class InfoNCELoss(nn.Module):
-#     def __init__(self, temperature=0.03):
-#         super().__init__()
-#         self.temperature = temperature
-
-#     def forward(self, anchor, positive, negative):
-#         pos_sim = torch.sum(anchor * positive, dim=-1) / self.temperature 
-#         neg_sim = negative @ anchor.T / self.temperature              
-
-#         mask = torch.eye(len(anchor), device=anchor.device).bool()
-#         neg_sim = neg_sim.masked_fill(mask, float('-inf'))
-
-#         logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1) 
-
-#         labels = torch.zeros(len(anchor), dtype=torch.long, device=anchor.device)
-
-#         loss = F.cross_entropy(logits, labels)
-
-#         return loss
-
-class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.05):
+class CompositeMetricLoss(nn.Module):
+    def __init__(self, margin=0.2, lambda_reg=0.3, lambda_metric=0.5):
         super().__init__()
-        self.temperature = temperature
+        self.margin = margin
+        self.lambda_reg = lambda_reg
+        self.lambda_metric = lambda_metric
 
-    def forward(self, anchor, positive, negatives):
-        # negatives shape: (B, K, dim)
-        B, K, D = negatives.shape
+    def forward(self, anchor, positive, negative, pos_mutations, neg_mutations):
+        # --- Cosine distance ---
+        pos_sim = F.cosine_similarity(anchor, positive)
+        neg_sim = F.cosine_similarity(anchor, negative)
 
-        # pos similarity: (B,)
-        pos_sim = torch.sum(anchor * positive, dim=-1) / self.temperature
+        pos_dist = 1 - pos_sim
+        neg_dist = 1 - neg_sim
 
-        # anchor: (B, dim) → (B, 1, dim)
-        anc = anchor.unsqueeze(1)
+        # --- Triplet Loss ---
+        triplet_loss = F.relu(pos_dist - neg_dist + self.margin).mean()
 
-        # neg similarity: (B, K)
-        neg_sim = torch.sum(anc * negatives, dim=-1) / self.temperature
+        # --- Regression Loss (mutations vs distance) ---
+        pos_mut = torch.tensor(pos_mutations, dtype=torch.float, device=anchor.device)
+        neg_mut = torch.tensor(neg_mutations, dtype=torch.float, device=anchor.device)
 
-        # logits = [pos | negs] → (B, K+1)
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
+        mut_counts = torch.cat([pos_mut, neg_mut])
+        dists = torch.cat([pos_dist, neg_dist])
 
-        labels = torch.zeros(B, dtype=torch.long, device=anchor.device)
-        return F.cross_entropy(logits, labels)
+        mut_norm = mut_counts / mut_counts.max()
+        regression_loss = F.mse_loss(dists, mut_norm)
+
+        # --- Metric Alignment Loss ---
+        cd = (pos_dist.mean() + neg_dist.mean()) / 2
+        cdd = neg_dist.mean() - pos_dist.mean()
+
+        # PCC 계산 (batch 단위)
+        if len(set(mut_counts.tolist())) > 1:
+            pcc = pearsonr(mut_counts.detach().cpu().numpy(),
+                           dists.detach().cpu().numpy())[0]
+        else:
+            pcc = 0.0
+
+        # normalize
+        cd_norm = (cd - cd.min()) / (cd.max() - cd.min() + 1e-12) if cd.numel() > 0 else 0.0
+        cdd_norm = (cdd - cdd.min()) / (cdd.max() - cdd.min() + 1e-12) if cdd.numel() > 0 else 0.0
+        pcc_norm = (pcc + 1) / 2  # [-1,1] → [0,1]
+
+        metric_score = (cd_norm + cdd_norm + pcc_norm) / 3
+        metric_loss = 1 - metric_score  # 점수를 최대화 → loss는 최소화
+
+        # --- Total Loss ---
+        total_loss = triplet_loss + self.lambda_reg * regression_loss + self.lambda_metric * metric_loss
+        return total_loss
+
+
+def normalize_metrics(values):
+    arr = np.array(values)
+    return (arr - arr.min()) / (arr.max() - arr.min() + 1e-12)
 
 
 def main():
@@ -153,7 +172,7 @@ def main():
 
     triplet_df = pd.read_csv(TRIPLET_PATH)
     # anchor, positive, negative, pos_mutations, neg_mutations 컬럼이 있다고 가정
-    triplet_data = triplet_df.values.tolist()[:50000]
+    triplet_data = triplet_df.values.tolist()
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
@@ -164,7 +183,7 @@ def main():
     model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
-    loss_fn = InfoNCELoss()
+    loss_fn = CompositeMetricLoss()
 
     print("학습 시작")
     model.train()
@@ -173,72 +192,69 @@ def main():
     for epoch in range(TRAIN_EPOCHS):
         random.shuffle(triplet_data)
         epoch_loss = []
-
-        # 평가용 기록
         all_pos_dists, all_neg_dists = [], []
         all_pos_mut, all_neg_mut = [], []
-
+    
         for i in tqdm(range(0, len(triplet_data), bs)):
             batch = triplet_data[i:i+bs]
             if len(batch) < 2: continue
-
+    
             anchors, poss, negs, pos_muts, neg_muts = zip(*batch)
             all_seqs = list(anchors) + list(poss) + list(negs)
-
-            enc = tokenizer(all_seqs, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt").to(device)
-
+    
+            enc = tokenizer(all_seqs, padding=True, truncation=True,
+                            max_length=MAX_LENGTH, return_tensors="pt").to(device)
+    
             with torch.cuda.amp.autocast(enabled=USE_FP16):
                 with torch.no_grad():
                     out = backbone(**enc, output_hidden_states=True)
-
+    
                 embs = model(out.hidden_states, enc['attention_mask'])
                 B = len(batch)
                 ea, ep, en = embs[:B], embs[B:2*B], embs[2*B:]
-
-                # POS/NEG similarity 기록
-                pos_sim = (ea * ep).sum(dim=-1).detach().cpu().numpy()
-                neg_sim = (ea * en).sum(dim=-1).detach().cpu().numpy()
-
-                all_pos_dists.extend(pos_sim.tolist())
-                all_neg_dists.extend(neg_sim.tolist())
+    
+                loss = loss_fn(ea, ep, en, pos_muts, neg_muts)
+    
+                pos_sim = F.cosine_similarity(ea, ep)
+                neg_sim = F.cosine_similarity(ea, en)
+    
+                pos_dist = (1 - pos_sim).detach().cpu().numpy()
+                neg_dist = (1 - neg_sim).detach().cpu().numpy()
+    
+                all_pos_dists.extend(pos_dist.tolist())
+                all_neg_dists.extend(neg_dist.tolist())
                 all_pos_mut.extend(pos_muts)
                 all_neg_mut.extend(neg_muts)
-
-                # Hard negative mining
-                K = 5
-                neg_sim_matrix = ea @ en.T
-                diag_mask = torch.eye(B, device=ea.device).bool()
-                neg_sim_matrix = neg_sim_matrix.masked_fill(diag_mask, float("-inf"))
-                _, topk_idx = torch.topk(neg_sim_matrix, K, dim=1)
-                en_topk = en[topk_idx]  # (B, K, dim)
-
-                loss = loss_fn(ea, ep, en_topk)
-
+    
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             opt.zero_grad()
             epoch_loss.append(loss.item())
-
+    
         # ====== 에포크 끝난 후 평가 지표 계산 ======
         cd = (np.mean(all_pos_dists) + np.mean(all_neg_dists)) / 2
         cdd = np.mean(all_neg_dists) - np.mean(all_pos_dists)
-
-        # PCC: 변이 개수 vs 거리
+    
         mut_counts = np.array(all_pos_mut + all_neg_mut)
         dists = np.array(all_pos_dists + all_neg_dists)
-        if len(set(mut_counts)) > 1:
-            pcc, _ = pearsonr(mut_counts, dists)
-        else:
-            pcc = 0.0
-
-        print(f"[Epoch {epoch+1}] Loss={np.mean(epoch_loss):.4f} | CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f}")
+        pcc = pearsonr(mut_counts, dists)[0] if len(set(mut_counts)) > 1 else 0.0
+    
+        cd_norm = normalize_metrics(all_pos_dists + all_neg_dists).mean()
+        cdd_norm = normalize_metrics(all_neg_dists).mean() - normalize_metrics(all_pos_dists).mean()
+        pcc_norm = (pcc + 1) / 2
+    
+        final_score = (cd_norm + cdd_norm + pcc_norm) / 3
+    
+        print(f"[Epoch {epoch+1}] Loss={np.mean(epoch_loss):.4f} | "
+              f"CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f} | "
+              f"FinalScore={final_score:.4f}")
 
     print("추론 시작")
     model.eval()
     sub_df = pd.read_csv(SAMPLE_SUB_PATH)
     embeddings = []
-    
+
     for i in tqdm(range(0, len(sequences), BATCH_SIZE_INFER)):
         batch = sequences[i:i+BATCH_SIZE_INFER]
         enc = tokenizer(batch, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt").to(device)
@@ -246,7 +262,7 @@ def main():
             out = backbone(**enc, output_hidden_states=True)
             emb = model(out.hidden_states, enc['attention_mask'])
             embeddings.append(emb.cpu().numpy())
-            
+
     embeddings = np.concatenate(embeddings, axis=0)
     col_names = [f"emb_{i:04d}" for i in range(OUTPUT_DIM)]
     emb_df = pd.DataFrame(embeddings, columns=col_names)
