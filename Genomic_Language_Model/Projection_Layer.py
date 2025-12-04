@@ -145,9 +145,10 @@ class CompositeMetricLoss(nn.Module):
         else:
             pcc = 0.0
 
-        # normalize
-        cd_norm = (cd - cd.min()) / (cd.max() - cd.min() + 1e-12) if cd.numel() > 0 else 0.0
-        cdd_norm = (cdd - cdd.min()) / (cdd.max() - cdd.min() + 1e-12) if cdd.numel() > 0 else 0.0
+        # === 개선된 정규화 ===
+        # batch 단위 분포에 대해 min-max scaling
+        cd_norm = (cd - pos_dist.min()) / (pos_dist.max() - pos_dist.min() + 1e-12)
+        cdd_norm = (cdd - neg_dist.min()) / (neg_dist.max() - neg_dist.min() + 1e-12)
         pcc_norm = (pcc + 1) / 2  # [-1,1] → [0,1]
 
         metric_score = (cd_norm + cdd_norm + pcc_norm) / 3
@@ -156,7 +157,6 @@ class CompositeMetricLoss(nn.Module):
         # --- Total Loss ---
         total_loss = triplet_loss + self.lambda_reg * regression_loss + self.lambda_metric * metric_loss
         return total_loss
-
 
 def normalize_metrics(values):
     arr = np.array(values)
