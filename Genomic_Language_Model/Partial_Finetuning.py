@@ -43,7 +43,7 @@ class TripletDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         return {
-            "anchor": row["seq"],
+            "anchor": row["anchor"],
             "pos": row["positive"],
             "neg": row["negative"],
             "pos_mut": row["pos_mutations"],
@@ -284,7 +284,7 @@ def main():
             print("TRAIN:", name)
 
     loss_fn = CompositeMetricLoss()
-    max_seq_len = ft_df["seq"].str.len().max()
+    max_seq_len = ft_df["anchor"].str.len().max()
     MODEL_CAP = tokenizer.model_max_length
     MAX_LEN = min(MODEL_CAP, max_seq_len)
 

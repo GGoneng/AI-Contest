@@ -32,7 +32,7 @@ BATCH_SIZE_TR = 32
 BATCH_SIZE_INFER = 32
 NUM_WORKERS = 2
 
-TRAIN_EPOCHS = 3
+TRAIN_EPOCHS = 5
 LR = 1e-4
 WEIGHT_DECAY = 1e-4
 
@@ -136,7 +136,7 @@ class CompositeMetricLoss(nn.Module):
 
         # --- Metric Alignment Loss ---
         cd = (pos_dist.mean() + neg_dist.mean()) / 2
-        cdd = neg_dist.mean() - pos_dist.mean()
+        cdd = (neg_dist.mean() - pos_dist.mean()) / 2
 
         # PCC 계산 (batch 단위)
         if len(set(mut_counts.tolist())) > 1:
@@ -145,11 +145,10 @@ class CompositeMetricLoss(nn.Module):
         else:
             pcc = 0.0
 
-        # === 개선된 정규화 ===
-        # batch 단위 분포에 대해 min-max scaling
-        cd_norm = (cd - pos_dist.min()) / (pos_dist.max() - pos_dist.min() + 1e-12)
-        cdd_norm = (cdd - neg_dist.min()) / (neg_dist.max() - neg_dist.min() + 1e-12)
-        pcc_norm = (pcc + 1) / 2  # [-1,1] → [0,1]
+        # === 정규화 ===
+        cd_norm = cd / 2
+        cdd_norm = (cdd + 1) / 2
+        pcc_norm = (pcc + 1) / 2 
 
         metric_score = (cd_norm + cdd_norm + pcc_norm) / 3
         metric_loss = 1 - metric_score  # 점수를 최대화 → loss는 최소화
@@ -172,7 +171,7 @@ def main():
 
     triplet_df = pd.read_csv(TRIPLET_PATH)
     # anchor, positive, negative, pos_mutations, neg_mutations 컬럼이 있다고 가정
-    triplet_data = triplet_df.values.tolist()
+    triplet_data = triplet_df.values.tolist()[:30000]
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
@@ -234,21 +233,28 @@ def main():
     
         # ====== 에포크 끝난 후 평가 지표 계산 ======
         cd = (np.mean(all_pos_dists) + np.mean(all_neg_dists)) / 2
-        cdd = np.mean(all_neg_dists) - np.mean(all_pos_dists)
-    
+        cdd = (np.mean(all_neg_dists) - np.mean(all_pos_dists)) / 2
+
         mut_counts = np.array(all_pos_mut + all_neg_mut)
         dists = np.array(all_pos_dists + all_neg_dists)
-        pcc = pearsonr(mut_counts, dists)[0] if len(set(mut_counts)) > 1 else 0.0
-    
-        cd_norm = normalize_metrics(all_pos_dists + all_neg_dists).mean()
-        cdd_norm = normalize_metrics(all_neg_dists).mean() - normalize_metrics(all_pos_dists).mean()
+
+        if len(set(mut_counts)) > 1:
+            pcc = pearsonr(mut_counts, dists)[0]
+        else:
+            pcc = 0.0
+
+        # === loss와 동일한 정규화 방식 적용 ===
+        cd_norm = cd / 2
+        cdd_norm = (cdd + 1) / 2
         pcc_norm = (pcc + 1) / 2
-    
+
         final_score = (cd_norm + cdd_norm + pcc_norm) / 3
-    
+
         print(f"[Epoch {epoch+1}] Loss={np.mean(epoch_loss):.4f} | "
-              f"CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f} | "
-              f"FinalScore={final_score:.4f}")
+            f"CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f} | "
+            f"CD_norm={cd_norm:.4f} | CDD_norm={cdd_norm:.4f} | PCC_norm={pcc_norm:.4f} | "
+            f"FinalScore={final_score:.4f}")
+
 
     print("추론 시작")
     model.eval()
