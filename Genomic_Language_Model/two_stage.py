@@ -275,7 +275,7 @@ def main():
     model = DualHeadModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
 
     print("Stage 1: Triplet-only")
-    loss1 = TripletOnlyLoss(margin=0.2)
+    loss1 = TripletLoss(margin=0.2)
     train(
         model=model,
         backbone=backbone,
@@ -284,7 +284,7 @@ def main():
         device=device,
         epochs=TRAIN_EPOCHS_STAGE1,
         batch_size=BATCH_SIZE_TR,
-        loss_fn=loss_stage1,
+        loss_fn=loss1,
         lr=LR_STAGE1,
         desc="Stage1"
     )
@@ -299,7 +299,7 @@ def main():
         device=device,
         epochs=TRAIN_EPOCHS_STAGE2,
         batch_size=BATCH_SIZE_TR,
-        loss_fn=loss_stage2,
+        loss_fn=loss2,
         lr=LR_STAGE2,
         desc="Stage2"
     )
