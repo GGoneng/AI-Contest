@@ -22,18 +22,22 @@ TEST_PATH = os.path.join(DATA_DIR, "test.csv")
 TRIPLET_PATH = os.path.join(DATA_DIR, "triplet_data.csv")
 SAMPLE_SUB_PATH = os.path.join(DATA_DIR, "sample_submission.csv")
 
-OUT_PATH = "submission_v16.csv"
+OUT_PATH = "submission_v17.csv"
 
 OUTPUT_DIM = 2048
-LAST_N_LAYERS = 4
+LAST_N_LAYERS = 6
 MAX_LENGTH = 512
 USE_FP16 = True
 BATCH_SIZE_TR = 32
 BATCH_SIZE_INFER = 32
 NUM_WORKERS = 2
 
-TRAIN_EPOCHS = 3
-LR = 5e-5
+TRAIN_EPOCHS_STAGE1 = 3     
+TRAIN_EPOCHS_STAGE2 = 1   
+
+LR_STAGE1 = 5e-5
+LR_STAGE2 = 2e-5        
+
 WEIGHT_DECAY = 1e-4
 
 def set_seed(seed: int=7):
@@ -63,48 +67,61 @@ class AttentionPooling(nn.Module):
         pooled = torch.sum(feats * weights.unsqueeze(-1), dim=1)
         return pooled
 
-class RobustModel(nn.Module):
-    def __init__(self, hidden_size: int, last_n: int, out_dim: int):
+class DualHeadModel(nn.Module):
+    def __init__(self, hidden_size: int, last_n: int, out_dim: int = 2048):
         super().__init__()
         self.last_n = last_n
-        self.layer_weights = nn.Parameter(torch.zeros(last_n)) 
-        self.pool = AttentionPooling(hidden_size)
+        self.layer_weights = nn.Parameter(torch.zeros(last_n))  # 마지막 N개 레이어 가중합
 
-        self.linear1 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.LayerNorm(hidden_size * 2),
+        # pooling
+        self.att_pool = AttentionPooling(hidden_size)
+
+        # Head A: mean pooling
+        self.headA_mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.GELU(),
-            nn.Dropout(0.1)
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, out_dim // 2)
         )
-        # self.linear2 = nn.Sequential(
-        #     nn.Linear(hidden_size * 2, hidden_size * 2),
-        #     nn.LayerNorm(hidden_size * 2),
-        #     nn.GELU(),
-        #     nn.Dropout(0.2)
-        # )
-        # self.linear3 = nn.Sequential(
-        #     nn.Linear(hidden_size * 2, hidden_size),
-        #     nn.LayerNorm(hidden_size),
-        #     nn.GELU(),
-        #     nn.Dropout(0.2)
-        # )
-        self.final = nn.Linear(hidden_size * 2, out_dim)
 
+        # Head B: attention pooling
+        self.headB_mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, out_dim // 2)
+        )
 
     def forward(self, hidden_states: List[torch.Tensor], mask: torch.Tensor):
-        stack = torch.stack(hidden_states[-self.last_n:], dim=0)
+        stack = torch.stack(hidden_states[-self.last_n:], dim=0)   
         w = F.softmax(self.layer_weights, dim=0).view(-1, 1, 1, 1)
-        feat = (stack * w).sum(dim=0) 
-        
-        mean_emb = self.pool(feat, mask)
-        
-        x = self.linear1(mean_emb)
-        # x = self.linear2(x) + x
-        # x = self.linear2(x) + x
-        # x = self.linear3(x)
-        x = self.final(x)
+        feat = (stack * w).sum(dim=0)                            
 
-        return l2_normalize(x)
+        # Head A: mean pooling
+        mean_pooled = (feat * mask.unsqueeze(-1)).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-12)
+        headA = self.headA_mlp(mean_pooled)                    
+      
+        # Head B: attention pooling
+        att_pooled = self.att_pool(feat, mask)                    
+        headB = self.headB_mlp(att_pooled)                        
+        emb = torch.cat([headA, headB], dim=-1)                  
+        return l2_normalize(emb)
+
+class TripletLoss(nn.Module):
+    def __init__(self, margin=0.2):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative, *args, **kwargs):
+        pos_sim = F.cosine_similarity(anchor, positive)
+        neg_sim = F.cosine_similarity(anchor, negative)
+        pos_dist = 1 - pos_sim
+        neg_dist = 1 - neg_sim
+        loss = F.relu(pos_dist - neg_dist + self.margin).mean()
+        return loss
+
 
 class CompositeMetricLoss(nn.Module):
     def __init__(self, margin=0.2, lambda_reg=0.1, lambda_metric=0.1):
@@ -162,79 +179,64 @@ def normalize_metrics(values):
     return (arr - arr.min()) / (arr.max() - arr.min() + 1e-12)
 
 
-def main():
-    set_seed(SEED)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    test_df = pd.read_csv(TEST_PATH)
-    sequences = test_df['seq'].tolist()
-
-    triplet_df = pd.read_csv(TRIPLET_PATH)
-    # anchor, positive, negative, pos_mutations, neg_mutations 컬럼이 있다고 가정
-    triplet_data = triplet_df.values.tolist()[:100000]
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
-    backbone.eval()
-    for p in backbone.parameters():
-        p.requires_grad = False
-
-    model = RobustModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
-    loss_fn = CompositeMetricLoss()
-
-    print("학습 시작")
+def train(model, backbone, tokenizer, triplet_data, device, 
+                    epochs, batch_size, loss_fn, lr, desc):
     model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_FP16)
 
-    bs = BATCH_SIZE_TR
-    for epoch in range(TRAIN_EPOCHS):
+    for epoch in range(epochs):
         random.shuffle(triplet_data)
         epoch_loss = []
         all_pos_dists, all_neg_dists = [], []
         all_pos_mut, all_neg_mut = [], []
-    
-        for i in tqdm(range(0, len(triplet_data), bs)):
-            batch = triplet_data[i:i+bs]
-            if len(batch) < 2: continue
-    
+
+        print(f"{desc} Epoch {epoch+1}/{epochs}")
+        for i in tqdm(range(0, len(triplet_data), batch_size)):
+            batch = triplet_data[i:i+batch_size]
+            if len(batch) < 2:
+                continue
+
             anchors, poss, negs, pos_muts, neg_muts = zip(*batch)
             all_seqs = list(anchors) + list(poss) + list(negs)
-    
-            enc = tokenizer(all_seqs, padding=True, truncation=True,
-                            max_length=MAX_LENGTH, return_tensors="pt").to(device)
-    
+
+            enc = tokenizer(
+                all_seqs,
+                padding=True,
+                truncation=True,
+                max_length=MAX_LENGTH,
+                return_tensors="pt"
+            ).to(device)
+
             with torch.cuda.amp.autocast(enabled=USE_FP16):
                 with torch.no_grad():
                     out = backbone(**enc, output_hidden_states=True)
-    
-                embs = model(out.hidden_states, enc['attention_mask'])
+
+                embs = model(out.hidden_states, enc["attention_mask"])
                 B = len(batch)
                 ea, ep, en = embs[:B], embs[B:2*B], embs[2*B:]
-    
+
                 loss = loss_fn(ea, ep, en, pos_muts, neg_muts)
-    
+
                 pos_sim = F.cosine_similarity(ea, ep)
                 neg_sim = F.cosine_similarity(ea, en)
-    
+
                 pos_dist = (1 - pos_sim).detach().cpu().numpy()
                 neg_dist = (1 - neg_sim).detach().cpu().numpy()
-    
+
                 all_pos_dists.extend(pos_dist.tolist())
                 all_neg_dists.extend(neg_dist.tolist())
                 all_pos_mut.extend(pos_muts)
                 all_neg_mut.extend(neg_muts)
-    
+
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             opt.zero_grad()
             epoch_loss.append(loss.item())
-    
-        # ====== 에포크 끝난 후 평가 지표 계산 ======
+
         cd = (np.mean(all_pos_dists) + np.mean(all_neg_dists)) / 2
         cdd = (np.mean(all_neg_dists) - np.mean(all_pos_dists)) / 2
-
         mut_counts = np.array(all_pos_mut + all_neg_mut)
         dists = np.array(all_pos_dists + all_neg_dists)
 
@@ -243,18 +245,64 @@ def main():
         else:
             pcc = 0.0
 
-        # === loss와 동일한 정규화 방식 적용 ===
         cd_norm = cd / 2
         cdd_norm = (cdd + 1) / 2
         pcc_norm = (pcc + 1) / 2
-
         final_score = (cd_norm + cdd_norm + pcc_norm) / 3
 
-        print(f"[Epoch {epoch+1}] Loss={np.mean(epoch_loss):.4f} | "
-            f"CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f} | "
-            f"CD_norm={cd_norm:.4f} | CDD_norm={cdd_norm:.4f} | PCC_norm={pcc_norm:.4f} | "
-            f"FinalScore={final_score:.4f}")
+        print(f"[{desc} {epoch+1}] "
+              f"Loss={np.mean(epoch_loss):.4f} | "
+              f"CD={cd:.4f} | CDD={cdd:.4f} | PCC={pcc:.4f} | "
+              f"CD_norm={cd_norm:.4f} | CDD_norm={cdd_norm:.4f} | PCC_norm={pcc_norm:.4f} | "
+              f"FinalScore={final_score:.4f}")
 
+def main():
+    set_seed(SEED)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    test_df = pd.read_csv(TEST_PATH)
+    sequences = test_df["seq"].tolist()
+
+    triplet_df = pd.read_csv(TRIPLET_PATH)
+    triplet_data = triplet_df.values.tolist()[:30000]
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad = False
+
+    model = DualHeadModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
+
+    print("Stage 1: Triplet-only")
+    loss1 = TripletOnlyLoss(margin=0.2)
+    train(
+        model=model,
+        backbone=backbone,
+        tokenizer=tokenizer,
+        triplet_data=triplet_data,
+        device=device,
+        epochs=TRAIN_EPOCHS_STAGE1,
+        batch_size=BATCH_SIZE_TR,
+        loss_fn=loss_stage1,
+        lr=LR_STAGE1,
+        desc="Stage1"
+    )
+
+    print("Stage 2: Metric fine-tune")
+    loss2 = CompositeMetricLoss(margin=0.2, lambda_reg=0.05, lambda_metric=0.05)
+    train(
+        model=model,
+        backbone=backbone,
+        tokenizer=tokenizer,
+        triplet_data=triplet_data,
+        device=device,
+        epochs=TRAIN_EPOCHS_STAGE2,
+        batch_size=BATCH_SIZE_TR,
+        loss_fn=loss_stage2,
+        lr=LR_STAGE2,
+        desc="Stage2"
+    )
 
     print("추론 시작")
     model.eval()
@@ -263,18 +311,27 @@ def main():
 
     for i in tqdm(range(0, len(sequences), BATCH_SIZE_INFER)):
         batch = sequences[i:i+BATCH_SIZE_INFER]
-        enc = tokenizer(batch, padding=True, truncation=True, max_length=MAX_LENGTH, return_tensors="pt").to(device)
+        enc = tokenizer(
+            batch,
+            padding=True,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_tensors="pt"
+        ).to(device)
+
         with torch.no_grad():
             out = backbone(**enc, output_hidden_states=True)
-            emb = model(out.hidden_states, enc['attention_mask'])
+            emb = model(out.hidden_states, enc["attention_mask"])
             embeddings.append(emb.cpu().numpy())
 
     embeddings = np.concatenate(embeddings, axis=0)
     col_names = [f"emb_{i:04d}" for i in range(OUTPUT_DIM)]
     emb_df = pd.DataFrame(embeddings, columns=col_names)
-    final_df = pd.concat([sub_df[['ID']], emb_df], axis=1)
+
+    final_df = pd.concat([sub_df[["ID"]], emb_df], axis=1)
     final_df.to_csv(OUT_PATH, index=False)
     print(f"저장: {OUT_PATH}")
+
 
 if __name__ == "__main__":
     main()
