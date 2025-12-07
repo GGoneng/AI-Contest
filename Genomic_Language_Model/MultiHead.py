@@ -34,9 +34,11 @@ NUM_WORKERS = 2
 
 TRAIN_EPOCHS_STAGE1 = 3     
 TRAIN_EPOCHS_STAGE2 = 1   
+TRAIN_EPOCHS_STAGE3 = 1
 
 LR_STAGE1 = 5e-5
-LR_STAGE2 = 2e-5        
+LR_STAGE2 = 2e-5      
+LR_STAGE3 = 5e-6  
 
 WEIGHT_DECAY = 1e-4
 
@@ -67,46 +69,60 @@ class AttentionPooling(nn.Module):
         pooled = torch.sum(feats * weights.unsqueeze(-1), dim=1)
         return pooled
 
-class DualHeadModel(nn.Module):
+class TripleHeadModel(nn.Module):
     def __init__(self, hidden_size: int, last_n: int, out_dim: int = 2048):
         super().__init__()
         self.last_n = last_n
-        self.layer_weights = nn.Parameter(torch.zeros(last_n))  # 마지막 N개 레이어 가중합
+        self.layer_weights = nn.Parameter(torch.zeros(last_n)) 
 
-        # pooling
         self.att_pool = AttentionPooling(hidden_size)
 
-        # Head A: mean pooling
-        self.headA_mlp = nn.Sequential(
+        # Head A: Mean Pooling
+        self.headA = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size, out_dim // 2)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, out_dim // 3)
         )
 
-        # Head B: attention pooling
-        self.headB_mlp = nn.Sequential(
+        # Head B: Attention Pooling
+        self.headB = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size, out_dim // 2)
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, out_dim // 3)
         )
 
-    def forward(self, hidden_states: List[torch.Tensor], mask: torch.Tensor):
-        stack = torch.stack(hidden_states[-self.last_n:], dim=0)   
+        # Head C: CLS Token Projection
+        self.headC = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, out_dim // 3)
+        )
+    
+        self.final_proj = nn.Linear(out_dim // 3 * 3, out_dim)
+
+    def forward(self, hidden_states, mask):
+        stack = torch.stack(hidden_states[-self.last_n:], dim=0)
         w = F.softmax(self.layer_weights, dim=0).view(-1, 1, 1, 1)
-        feat = (stack * w).sum(dim=0)                            
+        feat = (stack * w).sum(dim=0)
 
-        # Head A: mean pooling
-        mean_pooled = (feat * mask.unsqueeze(-1)).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-12)
-        headA = self.headA_mlp(mean_pooled)                    
-      
-        # Head B: attention pooling
-        att_pooled = self.att_pool(feat, mask)                    
-        headB = self.headB_mlp(att_pooled)                        
-        emb = torch.cat([headA, headB], dim=-1)                  
+        mean_pool = (feat * mask.unsqueeze(-1)).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-12)
+        outA = self.headA(mean_pool)
+
+        att_pool = self.att_pool(feat, mask)
+        outB = self.headB(att_pool)
+
+        cls_token = feat[:, 0, :]
+        outC = self.headC(cls_token)
+
+        emb = torch.cat([outA, outB, outC], dim=-1) 
+
+        emb = self.final_proj(emb)
         return l2_normalize(emb)
 
 class TripletLoss(nn.Module):
@@ -124,7 +140,7 @@ class TripletLoss(nn.Module):
 
 
 class CompositeMetricLoss(nn.Module):
-    def __init__(self, margin=0.2, lambda_reg=0.1, lambda_metric=0.1):
+    def __init__(self, margin=0.2, lambda_reg=0.05, lambda_metric=0.05):
         super().__init__()
         self.margin = margin
         self.lambda_reg = lambda_reg
@@ -272,7 +288,7 @@ def main():
     for p in backbone.parameters():
         p.requires_grad = False
 
-    model = DualHeadModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
+    model = TripleHeadModel(backbone.config.hidden_size, LAST_N_LAYERS, OUTPUT_DIM).to(device)
 
     print("Stage 1: Triplet-only")
     loss1 = TripletLoss(margin=0.2)
@@ -302,6 +318,21 @@ def main():
         loss_fn=loss2,
         lr=LR_STAGE2,
         desc="Stage2"
+    )
+
+    print("Stage 2: Smoothing")
+    loss3 = CompositeMetricLoss(margin=0.2, lambda_reg=0.0, lambda_metric=0.01)
+    train(
+        model=model,
+        backbone=backbone,
+        tokenizer=tokenizer,
+        triplet_data=triplet_data,
+        device=device,
+        epochs=TRAIN_EPOCHS_STAGE3,
+        batch_size=BATCH_SIZE_TR,
+        loss_fn=loss3,
+        lr=LR_STAGE3,
+        desc="Stage3"
     )
 
     print("추론 시작")

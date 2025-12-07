@@ -20,8 +20,8 @@ BASE_DIR = "./genomic_language_model"
 TRIPLET_PATH = os.path.join(BASE_DIR, "triplet_data.csv")
 BATCH_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-EPOCH = 10
-
+HEAD_EPOCH = 3
+FT_EPOCH = 1
 
 def set_seed(seed: int = 7) -> None:
     random.seed(seed)
@@ -50,7 +50,7 @@ class TripletDataset(Dataset):
             "neg_mut": row["neg_mutations"]
         }
 
-def get_embedding(backbone, seq_list, tokenizer, max_len, device):
+def get_embedding(model, seq_list, tokenizer, max_len, device):
     tokens = tokenizer(
         seq_list,
         return_tensors="pt",
@@ -61,7 +61,7 @@ def get_embedding(backbone, seq_list, tokenizer, max_len, device):
     tokens = {k: v.to(device) for k, v in tokens.items()}
 
     with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(device=="cuda")):
-        emb = backbone(tokens)
+        emb = model(tokens)
     return emb
 
 class EmbeddingModel(nn.Module):
@@ -86,17 +86,14 @@ class CompositeMetricLoss(nn.Module):
         self.lambda_metric = lambda_metric
 
     def forward(self, anchor, positive, negative, pos_mutations, neg_mutations):
-        # --- Cosine distance ---
         pos_sim = F.cosine_similarity(anchor, positive)
         neg_sim = F.cosine_similarity(anchor, negative)
 
         pos_dist = 1 - pos_sim
         neg_dist = 1 - neg_sim
 
-        # --- Triplet Loss ---
         triplet_loss = F.relu(pos_dist - neg_dist + self.margin).mean()
 
-        # --- Regression Loss (mutations vs distance) ---
         pos_mut = torch.tensor(pos_mutations, dtype=torch.float, device=anchor.device)
         neg_mut = torch.tensor(neg_mutations, dtype=torch.float, device=anchor.device)
 
@@ -106,32 +103,24 @@ class CompositeMetricLoss(nn.Module):
         mut_norm = mut_counts / mut_counts.max()
         regression_loss = F.mse_loss(dists, mut_norm)
 
-        # --- Metric Alignment Loss ---
         cd = (pos_dist.mean() + neg_dist.mean()) / 2
         cdd = (neg_dist.mean() - pos_dist.mean()) / 2
 
-        # PCC 계산 (batch 단위)
         if len(set(mut_counts.tolist())) > 1:
             pcc = pearsonr(mut_counts.detach().cpu().numpy(),
                            dists.detach().cpu().numpy())[0]
         else:
             pcc = 0.0
 
-        # === 정규화 ===
         cd_norm = cd / 2
         cdd_norm = (cdd + 1) / 2
         pcc_norm = (pcc + 1) / 2 
 
         metric_score = (cd_norm + cdd_norm + pcc_norm) / 3
-        metric_loss = 1 - metric_score  # 점수를 최대화 → loss는 최소화
+        metric_loss = 1 - metric_score 
 
-        # --- Total Loss ---
         total_loss = triplet_loss + self.lambda_reg * regression_loss + self.lambda_metric * metric_loss
         return total_loss
-
-def normalize_metrics(values):
-    arr = np.array(values)
-    return (arr - arr.min()) / (arr.max() - arr.min() + 1e-12)
 
 
 def validating(model, valDL, tokenizer, max_len, loss_fn, device):
@@ -185,17 +174,15 @@ def validating(model, valDL, tokenizer, max_len, loss_fn, device):
 
 def training(model, trainDL, valDL, optimizer, 
             epoch, tokenizer, max_len,
-            loss_fn, scheduler, device, scaler):
+            loss_fn, device, scaler):
     SAVE_PATH = "./saved_models"
+
     os.makedirs(SAVE_PATH, exist_ok=True)
-    BREAK_CNT_LOSS = 0
-    LIMIT_VALUE = 3
     LOSS_HISTORY = [[], []]
     use_amp = (DEVICE == "cuda")
 
     for count in range(1, epoch + 1):
         model.train()
-        SAVE_WEIGHT = os.path.join(SAVE_PATH, "model_weights")
         loss_total = 0
 
         for batch in tqdm(trainDL):
@@ -225,18 +212,6 @@ def training(model, trainDL, valDL, optimizer,
         print(f"[{count} / {epoch}]\n - TRAIN LOSS : {LOSS_HISTORY[0][-1]}")
         print(f"VAL LOSS : {LOSS_HISTORY[1][-1]}")
 
-        scheduler.step(val_loss)
-
-        if len(LOSS_HISTORY[0]) >= 2 and LOSS_HISTORY[0][-1] >= LOSS_HISTORY[0][-2]:
-            BREAK_CNT_LOSS += 1
-
-        if len(LOSS_HISTORY[0]) == 1 or LOSS_HISTORY[0][-1] < min(LOSS_HISTORY[0][:-1]):
-            torch.save(model.state_dict(), SAVE_WEIGHT)
-
-        if BREAK_CNT_LOSS > LIMIT_VALUE:
-            print(f"성능 및 손실 개선이 없어서 {count} EPOCH에 학습 중단")
-            break
-
     return LOSS_HISTORY
 
 def freeze_all(model):
@@ -248,42 +223,20 @@ def unfreeze_layers(model, target_layers):
         if any(t in name for t in target_layers):
             param.requires_grad = True
 
-def main():
-    ft_df = pd.read_csv(TRIPLET_PATH)
+def train_head_only(ft_df, tokenizer, backbone):
     train_df, val_df = train_test_split(ft_df, test_size=0.1, shuffle=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    backbone = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
-
-    target_layers = []
-    for i in range(26, 32):
-        target_layers += [
-            f"esm.encoder.layer.{i}.attention.self.query",
-            f"esm.encoder.layer.{i}.attention.self.key",
-            f"esm.encoder.layer.{i}.attention.self.value",
-            f"esm.encoder.layer.{i}.attention.self.output.dense",
-            f"esm.encoder.layer.{i}.intermediate.dense",
-            f"esm.encoder.layer.{i}.output.dense",
-            f"esm.encoder.layer.{i}.LayerNorm"
-        ]
-
     freeze_all(backbone)
-    unfreeze_layers(backbone, target_layers)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
 
     model = EmbeddingModel(backbone).to(DEVICE)
 
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in model.parameters())
-    
-    print(f"학습 파라미터 수: {trainable:,} / {total:,}")
+    head_params = list(model.proj.parameters())
+    optimizer = optim.AdamW([
+        {'params': head_params, 'lr': 5e-5}, 
+    ], weight_decay=1e-4)
 
-    for name, p in model.named_parameters():
-        if p.requires_grad:
-            print("TRAIN:", name)
+    loss_fn = CompositeMetricLoss(margin=0.2, lambda_reg=0.2, lambda_metric=0.3)
 
-    loss_fn = CompositeMetricLoss()
     max_seq_len = ft_df["anchor"].str.len().max()
     MODEL_CAP = tokenizer.model_max_length
     MAX_LEN = min(MODEL_CAP, max_seq_len)
@@ -294,30 +247,98 @@ def main():
     val_dataset = TripletDataset(val_df)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-    head_params = list(model.proj.parameters())
-    backbone_params = [p for n,p in model.named_parameters() if p.requires_grad and ('proj' not in n)]
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': 5e-5},
-        {'params': head_params, 'lr': 1e-4}
-    ], weight_decay=1e-4)
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE=="cuda"))
 
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=2)
-
-    loss = training(
+    print("=== Phase 1: Head-only training (backbone freeze) ===")
+    training(
         model=model,
         trainDL=train_loader,
         valDL=val_loader,
         optimizer=optimizer,
-        epoch=EPOCH,
+        epoch=HEAD_EPOCH,                       
         tokenizer=tokenizer,
         max_len=MAX_LEN,
         loss_fn=loss_fn,
-        scheduler=scheduler,
         device=DEVICE,
         scaler=scaler
     )
 
+    # 이 시점의 가중치 저장
+    torch.save(model.state_dict(), "./saved_models/model_head_only.pt")
+    return model, MAX_LEN
+
+def train_partial_ft(ft_df, tokenizer, backbone, max_len):
+    train_df, val_df = train_test_split(ft_df, test_size=0.1, shuffle=True)
+
+    model = EmbeddingModel(backbone).to(DEVICE)
+    state_dict = torch.load("./saved_models/model_head_only.pt", map_location=DEVICE)
+    model.load_state_dict(state_dict)
+
+    target_layers = []
+    for i in range(31, 32):
+        target_layers += [
+            f"esm.encoder.layer.{i}.attention.self.query",
+            f"esm.encoder.layer.{i}.attention.self.key",
+            f"esm.encoder.layer.{i}.attention.self.value",
+            f"esm.encoder.layer.{i}.attention.self.output.dense",
+            f"esm.encoder.layer.{i}.intermediate.dense",
+            f"esm.encoder.layer.{i}.output.dense",
+            f"esm.encoder.layer.{i}.LayerNorm"
+        ]
+
+    freeze_all(model.backbone)
+    unfreeze_layers(model.backbone, target_layers)
+
+    for p in model.proj.parameters():
+        p.requires_grad = True
+
+    head_params = [p for n, p in model.named_parameters() if p.requires_grad and ('proj' in n)]
+    backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and ('proj' not in n)]
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': 5e-7},  
+        {'params': head_params, 'lr': 5e-5},
+    ], weight_decay=0.0) 
+
+    loss_fn = CompositeMetricLoss(margin=0.2, lambda_reg=0.1, lambda_metric=0.2)
+
+    train_dataset = TripletDataset(train_df)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    val_dataset = TripletDataset(val_df)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE=="cuda"))
+
+    print("=== Phase 2: Partial fine-tuning (last layers only) ===")
+    training(
+        model=model,
+        trainDL=train_loader,
+        valDL=val_loader,
+        optimizer=optimizer,
+        epoch=FT_EPOCH,        
+        tokenizer=tokenizer,
+        max_len=max_len,
+        loss_fn=loss_fn,
+        device=DEVICE,
+        scaler=scaler
+    )
+
+    torch.save(model.state_dict(), "./saved_models/model_partial_ft.pt")
+    return model
+
+def main():
+    ft_df = pd.read_csv(TRIPLET_PATH) 
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    backbone = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+    model_head, max_len = train_head_only(ft_df, tokenizer, backbone)
+
+    model_final = train_partial_ft(ft_df, tokenizer, backbone, max_len)
+
     print("파인튜닝 완료")
+
 
 if __name__ == "__main__":
     main()
