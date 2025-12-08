@@ -27,7 +27,7 @@ BASE_DIR = "./genomic_language_model"
 
 TEST_PATH = os.path.join(BASE_DIR, "test.csv")
 SUB_PATH = os.path.join(BASE_DIR, "sample_submission.csv")
-SAVE_WEIGHT = "./saved_models/model_weights"
+SAVE_WEIGHT = os.path.join(BASE_DIR, "model_partial_ft.pt")
 
 test_df = pd.read_csv(TEST_PATH)
 sub_df = pd.read_csv(SUB_PATH)

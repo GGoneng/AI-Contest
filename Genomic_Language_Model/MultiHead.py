@@ -103,8 +103,6 @@ class TripleHeadModel(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_size, out_dim // 3)
         )
-    
-        self.final_proj = nn.Linear(out_dim // 3 * 3, out_dim)
 
     def forward(self, hidden_states, mask):
         stack = torch.stack(hidden_states[-self.last_n:], dim=0)
@@ -122,7 +120,6 @@ class TripleHeadModel(nn.Module):
 
         emb = torch.cat([outA, outB, outC], dim=-1) 
 
-        emb = self.final_proj(emb)
         return l2_normalize(emb)
 
 class TripletLoss(nn.Module):
@@ -140,53 +137,49 @@ class TripletLoss(nn.Module):
 
 
 class CompositeMetricLoss(nn.Module):
-    def __init__(self, margin=0.2, lambda_reg=0.05, lambda_metric=0.05):
+    def __init__(self, margin=0.2, lambda_reg=0.05, lambda_metric=0.05,
+                 global_max=None):
         super().__init__()
         self.margin = margin
         self.lambda_reg = lambda_reg
         self.lambda_metric = lambda_metric
+        self.global_max = global_max
 
     def forward(self, anchor, positive, negative, pos_mutations, neg_mutations):
-        # --- Cosine distance ---
         pos_sim = F.cosine_similarity(anchor, positive)
         neg_sim = F.cosine_similarity(anchor, negative)
 
         pos_dist = 1 - pos_sim
         neg_dist = 1 - neg_sim
 
-        # --- Triplet Loss ---
         triplet_loss = F.relu(pos_dist - neg_dist + self.margin).mean()
 
-        # --- Regression Loss (mutations vs distance) ---
         pos_mut = torch.tensor(pos_mutations, dtype=torch.float, device=anchor.device)
         neg_mut = torch.tensor(neg_mutations, dtype=torch.float, device=anchor.device)
 
         mut_counts = torch.cat([pos_mut, neg_mut])
         dists = torch.cat([pos_dist, neg_dist])
 
-        mut_norm = mut_counts / mut_counts.max()
+        mut_norm = torch.log1p(mut_counts) / np.log1p(self.global_max)
+
         regression_loss = F.mse_loss(dists, mut_norm)
 
-        # --- Metric Alignment Loss ---
         cd = (pos_dist.mean() + neg_dist.mean()) / 2
         cdd = (neg_dist.mean() - pos_dist.mean()) / 2
 
-        # PCC 계산 (batch 단위)
         if len(set(mut_counts.tolist())) > 1:
             pcc = pearsonr(mut_counts.detach().cpu().numpy(),
                            dists.detach().cpu().numpy())[0]
         else:
             pcc = 0.0
 
-        # === 정규화 ===
         cd_norm = cd / 2
         cdd_norm = (cdd + 1) / 2
-        pcc_norm = (pcc + 1) / 2 
+        pcc_norm = (pcc + 1) / 2
 
         metric_score = (cd_norm + cdd_norm + pcc_norm) / 3
-        metric_loss = 1 - metric_score  # 점수를 최대화 → loss는 최소화
+        metric_loss = 1 - metric_score
 
-        # --- Total Loss ---
         total_loss = triplet_loss + self.lambda_reg * regression_loss + self.lambda_metric * metric_loss
         return total_loss
 
@@ -280,7 +273,16 @@ def main():
     sequences = test_df["seq"].tolist()
 
     triplet_df = pd.read_csv(TRIPLET_PATH)
-    triplet_data = triplet_df.values.tolist()[:30000]
+    triplet_df = triplet_df.iloc[:50000].reset_index(drop=True)
+
+    all_mut = np.concatenate([
+        triplet_df["pos_mutations"].values,
+        triplet_df["neg_mutations"].values
+    ])
+
+    GLOBAL_MUT_MAX = all_mut.max()
+
+    triplet_data = triplet_df.values.tolist()
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     backbone = AutoModelForMaskedLM.from_pretrained(MODEL_ID, trust_remote_code=True).to(device)
@@ -306,7 +308,7 @@ def main():
     )
 
     print("Stage 2: Metric fine-tune")
-    loss2 = CompositeMetricLoss(margin=0.2, lambda_reg=0.05, lambda_metric=0.05)
+    loss2 = CompositeMetricLoss(margin=0.2, lambda_reg=0.05, lambda_metric=0.02, global_max=GLOBAL_MUT_MAX)
     train(
         model=model,
         backbone=backbone,
@@ -320,8 +322,8 @@ def main():
         desc="Stage2"
     )
 
-    print("Stage 2: Smoothing")
-    loss3 = CompositeMetricLoss(margin=0.2, lambda_reg=0.0, lambda_metric=0.01)
+    print("Stage 3: Smoothing")
+    loss3 = CompositeMetricLoss(margin=0.2, lambda_reg=0.0, lambda_metric=0.005, global_max=GLOBAL_MUT_MAX)
     train(
         model=model,
         backbone=backbone,
